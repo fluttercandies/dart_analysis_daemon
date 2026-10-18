@@ -1,0 +1,61 @@
+name: Pub Publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Validate only (uncheck to publish)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pub-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - run: dart pub get
+      - name: Verify release tag matches package version
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version: *//p' pubspec.yaml | tr -d '\r')
+          test "$RELEASE_TAG" = "$version" || test "$RELEASE_TAG" = "v$version"
+      - name: Check formatting
+        run: dart format --output=none --set-exit-if-changed .
+      - name: Analyze runtime and tests
+        run: dart analyze lib bin test
+      - name: Run tests
+        run: dart test
+      - name: Publish dry-run
+        run: dart pub publish --dry-run
+      - name: Configure Pub credentials
+        if: github.event_name == 'release' || inputs.dry_run == false
+        env:
+          CREDENTIAL_JSON: ${{ secrets.CREDENTIAL_JSON }}
+        shell: bash
+        run: |
+          test -n "$CREDENTIAL_JSON" || { echo 'Missing CREDENTIAL_JSON repository secret'; exit 1; }
+          install -d -m 700 "$HOME/.config/dart"
+          printf '%s' "$CREDENTIAL_JSON" > "$HOME/.config/dart/pub-credentials.json"
+          chmod 600 "$HOME/.config/dart/pub-credentials.json"
+      - name: Publish
+        if: github.event_name == 'release' || inputs.dry_run == false
+        run: dart pub publish --force
+      - name: Remove credentials
+        if: always()
+        shell: bash
+        run: rm -f "$HOME/.config/dart/pub-credentials.json"

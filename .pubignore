@@ -1,0 +1,11 @@
+.dart_tool/
+.packages
+build/
+dist/
+.DS_Store
+pubspec.lock
+*.bootstrap.isolate.dart
+.smoke-sdk/
+.real-sdk-smoke/
+/.github/
+/tool/

@@ -1,0 +1,33 @@
+name: Package validation
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - run: dart pub get
+      - name: Check formatting
+        run: dart format --output=none --set-exit-if-changed .
+      - run: dart analyze lib bin test
+      - name: Run tests
+        run: dart test --reporter=expanded
+      - name: Publish dry-run
+        if: matrix.os == 'macos-latest'
+        run: dart pub publish --dry-run
