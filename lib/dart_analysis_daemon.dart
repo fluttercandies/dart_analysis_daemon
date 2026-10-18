@@ -5,4 +5,4 @@ export 'src/session_client.dart' show SessionClient;
 export 'src/ide_bridge.dart' show IdeBridgeClient, IdeBridgeEndpoint;
 
 /// Package version.
-const packageVersion = '0.1.0';
+const packageVersion = '0.1.2';

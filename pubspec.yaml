@@ -2,7 +2,7 @@ name: dart_analysis_daemon
 description: A root-scoped persistent Dart analysis session for incremental checks and full analysis gates.
 homepage: https://github.com/fluttercandies/dart_analysis_daemon
 repository: https://github.com/fluttercandies/dart_analysis_daemon
-version: 0.1.0
+version: 0.1.2
 topics:
   - dart-analyzer
   - analysis-server

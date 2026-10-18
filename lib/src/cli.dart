@@ -6,6 +6,7 @@ import 'package:args/args.dart';
 import 'package:args/command_runner.dart';
 import 'package:dart_analysis_daemon/dart_analysis_daemon.dart';
 import 'package:dart_analysis_daemon/src/analyzer_pool.dart';
+import 'package:dart_analysis_daemon/src/dart_project.dart';
 import 'package:dart_analysis_daemon/src/session_server.dart';
 import 'package:dart_analysis_daemon/src/session_idle_policy.dart';
 import 'check_exit_code.dart';
@@ -316,15 +317,22 @@ Future<int> _connect(
   if (reuseIde != 'never' &&
       !useStdin &&
       ((mode ?? 'fast') == 'full' || files.isNotEmpty)) {
-    final bridgeResult = await _tryIdeBridge(
-      root,
-      mode: mode ?? 'fast',
-      files: files,
-      required: reuseIde == 'require',
-      exitCodeFor: exitCodeFor,
-      settleTimeout: bridgeSettleTimeout,
-    );
-    if (bridgeResult != null) return bridgeResult;
+    if (await isDartProjectRoot(root)) {
+      final bridgeResult = await _tryIdeBridge(
+        root,
+        mode: mode ?? 'fast',
+        files: files,
+        required: reuseIde == 'require',
+        exitCodeFor: exitCodeFor,
+        settleTimeout: bridgeSettleTimeout,
+      );
+      if (bridgeResult != null) return bridgeResult;
+    } else if (reuseIde == 'require') {
+      stderr.writeln(
+        'Cannot require IDE analyzer reuse: $root is not a detected Dart project.',
+      );
+      return 69;
+    }
   }
   // Auto-join a shared multi-root pool when enabled: if another project is
   // already running a pool, join it with addRoot and analyze inside that one

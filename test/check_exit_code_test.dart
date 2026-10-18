@@ -231,6 +231,9 @@ void main() {
 
     setUp(() async {
       project = await Directory.systemTemp.createTemp('dana-exit-code-test-');
+      await File(
+        '${project.path}${Platform.pathSeparator}pubspec.yaml',
+      ).writeAsString('name: dana_exit_code_fixture\n');
       server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
       server.listen((socket) {
         socket
@@ -375,4 +378,43 @@ void main() {
       });
     }
   });
+
+  test(
+    'required IDE reuse rejects a non-Dart root without connecting',
+    () async {
+      final project = await Directory.systemTemp.createTemp(
+        'dana-non-dart-root-',
+      );
+      try {
+        final packageRoot = Directory.current.path;
+        final result = await Process.run(Platform.resolvedExecutable, [
+          '--packages=$packageRoot/.dart_tool/package_config.json',
+          '$packageRoot/bin/dart_analysis_daemon.dart',
+          'check',
+          '--root',
+          project.path,
+          '--mode',
+          'full',
+          '--reuse-ide',
+          'require',
+        ]).timeout(const Duration(seconds: 60));
+
+        expect(
+          result.exitCode,
+          69,
+          reason: '${result.stdout}\n${result.stderr}',
+        );
+        expect('${result.stderr}', contains('not a detected Dart project'));
+        expect('${result.stdout}', isEmpty);
+        expect(
+          await Directory(
+            '${project.path}${Platform.pathSeparator}.dart_tool',
+          ).exists(),
+          isFalse,
+        );
+      } finally {
+        await project.delete(recursive: true);
+      }
+    },
+  );
 }

@@ -11,6 +11,7 @@ import 'windows_disk_snapshot.dart';
 /// Bounded configuration observation, not a snapshot of all dependencies.
 /// Runs in a separate isolate; Windows reads retain file identity and content.
 class EnvironmentIdentity {
+  Directory? _captureRoot;
   final _records = <String, Object?>{};
   final _options = <String>{};
   final _active = <String>{};
@@ -28,6 +29,7 @@ class EnvironmentIdentity {
 
   Future<String> capture(String requestedRoot) async {
     final root = Directory(requestedRoot).resolveSymbolicLinksSync();
+    _captureRoot = Directory(root);
     for (final name in [
       'pubspec.yaml',
       'pubspec.lock',
@@ -48,7 +50,6 @@ class EnvironmentIdentity {
         File('${parent.path}/analysis_options.yaml'),
         packageConfig: rootConfig,
       );
-      _read(File('${parent.path}/.dart_tool/package_config.json'));
       final next = parent.parent;
       if (next.path == parent.path) break;
       parent = next;
@@ -207,6 +208,8 @@ class EnvironmentIdentity {
     for (var depth = 0; depth <= 64; depth++) {
       final file = File('${directory.path}/.dart_tool/package_config.json');
       if (_read(file) != null) return file;
+      final root = _captureRoot;
+      if (root != null && directory.path == root.path) return null;
       final next = directory.parent;
       if (next.path == directory.path) return null;
       directory = next;

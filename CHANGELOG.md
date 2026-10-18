@@ -1,3 +1,12 @@
+## 0.1.2
+
+- Keep parent `.dart_tool` package configurations out of project identity checks.
+
+## 0.1.1
+
+- Reuse the IDE analyzer only for detected Dart project roots, including
+  monorepos with nested Dart packages.
+
 ## 0.1.0
 
 - Resolve CLI file and folder arguments against the requested root before
