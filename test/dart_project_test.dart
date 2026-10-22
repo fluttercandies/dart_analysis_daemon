@@ -36,11 +36,11 @@ void main() {
     }
   });
 
-  test('recognizes a standalone Dart source tree', () async {
+  test('requires pubspec.yaml for a standalone Dart source tree', () async {
     final workspace = await Directory.systemTemp.createTemp('dana-loose-dart-');
     try {
       await File('${workspace.path}/main.dart').writeAsString('void main() {}');
-      expect(await isDartProjectRoot(workspace.path), isTrue);
+      expect(await isDartProjectRoot(workspace.path), isFalse);
     } finally {
       await workspace.delete(recursive: true);
     }

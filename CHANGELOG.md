@@ -1,5 +1,7 @@
 ## 0.1.2
 
+- Require `pubspec.yaml` within the workspace for IDE bridge reuse;
+  `.dart_tool`, legacy package metadata and loose Dart files do not qualify.
 - Keep parent `.dart_tool` package configurations out of project identity checks.
 
 ## 0.1.1

@@ -17,8 +17,10 @@ const _ignoredDirectories = {
 
 /// Returns whether [path] is a Dart project, package, or workspace root.
 ///
-/// The bounded search recognizes nested packages in monorepos and loose Dart
-/// source trees without traversing generated or vendored directories.
+/// The bounded search recognizes packages with `pubspec.yaml`, including
+/// nested packages in monorepos, without traversing generated or vendored
+/// directories. Generated metadata and loose Dart files alone do not qualify
+/// a workspace for the IDE bridge.
 Future<bool> isDartProjectRoot(String path) async {
   final root = Directory(path);
   try {
@@ -36,9 +38,6 @@ Future<bool> isDartProjectRoot(String path) async {
       if (await _hasDartMarker(current.directory)) return true;
       await for (final entity in current.directory.list(followLinks: false)) {
         if (++entries > _maxSearchEntries) return false;
-        if (entity is File && entity.path.toLowerCase().endsWith('.dart')) {
-          return true;
-        }
         if (entity is Directory) {
           final name =
               entity.uri.pathSegments
@@ -57,10 +56,5 @@ Future<bool> isDartProjectRoot(String path) async {
   }
 }
 
-Future<bool> _hasDartMarker(Directory directory) async {
-  return await File.fromUri(directory.uri.resolve('pubspec.yaml')).exists() ||
-      await File.fromUri(
-        directory.uri.resolve('.dart_tool/package_config.json'),
-      ).exists() ||
-      await File.fromUri(directory.uri.resolve('.packages')).exists();
-}
+Future<bool> _hasDartMarker(Directory directory) =>
+    File.fromUri(directory.uri.resolve('pubspec.yaml')).exists();
