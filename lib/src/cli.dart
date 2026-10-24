@@ -435,7 +435,17 @@ Future<int?> _tryPool(
   try {
     client = await PoolClient.connect(registration);
     final joined = await client.addRoot(canonical);
-    if (joined['ok'] != true) return null;
+    if (joined['ok'] != true) {
+      if (joined['code'] == 'pool-admission-denied') {
+        stdout.writeln(jsonEncode(joined));
+        stderr.writeln(
+          '${joined['error'] ?? 'The shared analyzer pool refused this root.'} '
+          'No separate analyzer was started.',
+        );
+        return 75;
+      }
+      return null;
+    }
     final response =
         mode == 'full'
             ? await client.fullCheck(root: canonical)

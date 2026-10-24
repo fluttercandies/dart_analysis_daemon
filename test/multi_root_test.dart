@@ -202,7 +202,7 @@ void main() {
   );
 
   test(
-    'memory eviction waits for released memory instead of evicting every root',
+    'memory eviction returns promptly and preserves other roots during recovery',
     () async {
       final c = await _fixture('settle_c');
       final e = await _fixture('settle_e');
@@ -223,7 +223,6 @@ void main() {
       // real analyzer returning pages (measured ~5 s for ~7 GiB on macOS).
       late AnalyzerDaemon managed;
       var memoryRoots = 0;
-      var delays = 0;
       var pressured = false;
       int available() {
         final active = managed.activeRoots.length;
@@ -240,12 +239,6 @@ void main() {
           recoveryBytes: 0,
         ),
         now: () => clock,
-        delay: (_) async {
-          delays++;
-          if (delays.isEven && memoryRoots > managed.activeRoots.length) {
-            memoryRoots--;
-          }
-        },
       );
       await managed.start();
       addTearDown(managed.close);
@@ -262,8 +255,15 @@ void main() {
       tick();
       final admitted = await managed.ensureRoot(rootE);
       expect(admitted.evicted, [rootB], reason: 'only the LRU root goes');
+      expect(admitted.deniedReason, 'memory-pressure');
+      expect(managed.activeRoots, unorderedEquals([rootA, rootC]));
+      final retry = await managed.ensureRoot(rootE);
+      expect(retry.evicted, isEmpty, reason: 'cooldown preserves C');
+      expect(retry.deniedReason, 'memory-pressure');
+      memoryRoots--;
+      clock = clock.add(const Duration(seconds: 10));
+      expect((await managed.ensureRoot(rootE)).added, isTrue);
       expect(managed.activeRoots, unorderedEquals([rootA, rootC, rootE]));
-      expect(delays, greaterThan(0), reason: 'eviction waited for release');
     },
   );
 
@@ -315,7 +315,249 @@ void main() {
     addTearDown(single.close);
     final admitted = await single.ensureRoot(rootB);
     expect(admitted.evicted, isEmpty, reason: 'only the primary is active');
-    expect(single.activeRoots, containsAll([rootA, rootB]));
+    expect(admitted.added, isFalse);
+    expect(admitted.deniedReason, 'root-limit');
+    expect(single.activeRoots, [rootA]);
+  });
+
+  test('root-cap denial is immediate even while analysis is active', () async {
+    final rootA = a.resolveSymbolicLinksSync();
+    final rootB = b.resolveSymbolicLinksSync();
+    var clock = DateTime.utc(2026, 1, 1);
+    final managed = AnalyzerDaemon(
+      rootA,
+      maxRoots: 1,
+      now: () => clock,
+      analysisInProgress: () => true,
+    );
+    await managed.start();
+    addTearDown(managed.close);
+
+    final result = await managed.ensureRoot(rootB);
+    expect(result.added, isFalse);
+    expect(result.deniedReason, 'root-limit');
+    expect(result.evicted, isEmpty);
+    expect(managed.activeRoots, [rootA]);
+  });
+
+  test(
+    'memory pressure rejects a root when no recoverable root exists',
+    () async {
+      final rootA = a.resolveSymbolicLinksSync();
+      final rootB = b.resolveSymbolicLinksSync();
+      var clock = DateTime.utc(2026, 1, 1);
+      final managed = AnalyzerDaemon(
+        rootA,
+        memorySampler: () => _memory(500, clock),
+        budgetPolicy: GlobalBudgetPolicy(
+          reserveBytes: 1000 * bytesPerMiB,
+          startupBytes: 0,
+        ),
+        now: () => clock,
+      );
+      await managed.start();
+      addTearDown(managed.close);
+
+      final result = await managed.ensureRoot(rootB);
+      expect(result.added, isFalse);
+      expect(result.deniedReason, 'memory-pressure');
+      expect(managed.activeRoots, [rootA]);
+    },
+  );
+
+  test(
+    'memory policy fails closed when the system sampler is unavailable',
+    () async {
+      final rootA = a.resolveSymbolicLinksSync();
+      final rootB = b.resolveSymbolicLinksSync();
+      final managed = AnalyzerDaemon(rootA, budgetPolicy: GlobalBudgetPolicy());
+      await managed.start();
+      addTearDown(managed.close);
+
+      final result = await managed.ensureRoot(rootB);
+      expect(result.added, isFalse);
+      expect(result.deniedReason, 'memory-sample-unavailable');
+      expect(managed.activeRoots, [rootA]);
+    },
+  );
+
+  test(
+    'denied admission reports roots evicted while seeking headroom',
+    () async {
+      final c = await _fixture('denied_c');
+      addTearDown(() async {
+        if (await c.exists()) await c.delete(recursive: true);
+      });
+      final rootA = a.resolveSymbolicLinksSync();
+      final rootB = b.resolveSymbolicLinksSync();
+      final rootC = c.resolveSymbolicLinksSync();
+      var clock = DateTime.utc(2026, 1, 1);
+      var availableMiB = 5000;
+      final managed = AnalyzerDaemon(
+        rootA,
+        memorySampler: () => _memory(availableMiB, clock),
+        budgetPolicy: GlobalBudgetPolicy(
+          reserveBytes: 1000 * bytesPerMiB,
+          startupBytes: 0,
+        ),
+        evictionSettleLimit: Duration.zero,
+        now: () => clock,
+      );
+      await managed.start();
+      addTearDown(managed.close);
+      expect((await managed.ensureRoot(rootB)).added, isTrue);
+      await managed.handle({'op': 'fullCheck', 'root': rootB});
+
+      availableMiB = 500;
+      final response = await managed.handle({'op': 'addRoot', 'root': rootC});
+      expect(response['ok'], isFalse);
+      expect(response['reason'], 'memory-pressure');
+      expect(response['evicted'], [rootB]);
+      expect(managed.activeRoots, [rootA]);
+    },
+  );
+
+  test(
+    'runtime monitor reclaims idle LRU roots with pressure hysteresis',
+    () async {
+      final c = await _fixture('monitor_c');
+      addTearDown(() async {
+        if (await c.exists()) await c.delete(recursive: true);
+      });
+      final rootA = a.resolveSymbolicLinksSync();
+      final rootB = b.resolveSymbolicLinksSync();
+      final rootC = c.resolveSymbolicLinksSync();
+      var clock = DateTime.utc(2026, 1, 1);
+      var availableMiB = 5000;
+      var analysisActive = false;
+      final managed = AnalyzerDaemon(
+        rootA,
+        memorySampler: () => _memory(availableMiB, clock),
+        budgetPolicy: GlobalBudgetPolicy(
+          reserveBytes: 1000 * bytesPerMiB,
+          startupBytes: 0,
+          recoveryBytes: 500 * bytesPerMiB,
+        ),
+        runtimeIdleGrace: const Duration(seconds: 1),
+        now: () => clock,
+        analysisInProgress: () => analysisActive,
+      );
+      await managed.start();
+      addTearDown(managed.close);
+      expect((await managed.ensureRoot(rootB)).added, isTrue);
+      expect((await managed.ensureRoot(rootC)).added, isTrue);
+      await managed.handle({'op': 'fullCheck', 'root': rootC});
+
+      availableMiB = 500;
+      clock = clock.add(const Duration(seconds: 2));
+      analysisActive = true;
+      expect(await managed.monitorMemoryPressureOnce(), isEmpty);
+      expect(await managed.monitorMemoryPressureOnce(), isEmpty);
+      expect(managed.activeRoots, contains(rootB));
+
+      analysisActive = false;
+      expect(await managed.monitorMemoryPressureOnce(), isEmpty);
+      expect(await managed.monitorMemoryPressureOnce(), [rootB]);
+      expect(managed.activeRoots, contains(rootC));
+      expect(await managed.monitorMemoryPressureOnce(), isEmpty);
+      clock = clock.add(const Duration(seconds: 10));
+      availableMiB = 5000;
+      expect(await managed.monitorMemoryPressureOnce(), isEmpty);
+      availableMiB = 500;
+      clock = clock.add(const Duration(seconds: 2));
+      expect(await managed.monitorMemoryPressureOnce(), isEmpty);
+      expect(await managed.monitorMemoryPressureOnce(), [rootC]);
+      expect(managed.activeRoots, [rootA]);
+    },
+  );
+
+  test('multi-root monitor ignores warn and reclaims on critical', () async {
+    final rootA = a.resolveSymbolicLinksSync();
+    final rootB = b.resolveSymbolicLinksSync();
+    var clock = DateTime.utc(2026, 1, 1);
+    var pressureLevel = 2;
+    final managed = AnalyzerDaemon(
+      rootA,
+      memorySampler:
+          () => macSnapshot(
+            totalPhysicalBytes: 24576 * bytesPerMiB,
+            availablePhysicalBytes: 5000 * bytesPerMiB,
+            pressureLevel: pressureLevel,
+            sampledAt: clock,
+          ),
+      budgetPolicy: GlobalBudgetPolicy(
+        reserveBytes: 1000 * bytesPerMiB,
+        startupBytes: 0,
+        recoveryBytes: 500 * bytesPerMiB,
+        ignoreWarnPressure: true,
+      ),
+      runtimeIdleGrace: const Duration(seconds: 1),
+      now: () => clock,
+    );
+    await managed.start();
+    addTearDown(managed.close);
+    expect((await managed.ensureRoot(rootB)).added, isTrue);
+
+    clock = clock.add(const Duration(seconds: 2));
+    expect(await managed.monitorMemoryPressureOnce(), isEmpty);
+    expect(await managed.monitorMemoryPressureOnce(), isEmpty);
+    expect(managed.activeRoots, contains(rootB));
+
+    pressureLevel = 4;
+    expect(await managed.monitorMemoryPressureOnce(), isEmpty);
+    expect(await managed.monitorMemoryPressureOnce(), [rootB]);
+    expect(managed.activeRoots, [rootA]);
+  });
+
+  test(
+    'multi-root monitor treats warn as pressure without the opt-in rule',
+    () async {
+      final rootA = a.resolveSymbolicLinksSync();
+      final rootB = b.resolveSymbolicLinksSync();
+      var clock = DateTime.utc(2026, 1, 1);
+      var pressureLevel = 1;
+      final managed = AnalyzerDaemon(
+        rootA,
+        memorySampler:
+            () => macSnapshot(
+              totalPhysicalBytes: 24576 * bytesPerMiB,
+              availablePhysicalBytes: 5000 * bytesPerMiB,
+              pressureLevel: pressureLevel,
+              sampledAt: clock,
+            ),
+        budgetPolicy: GlobalBudgetPolicy(
+          reserveBytes: 1000 * bytesPerMiB,
+          startupBytes: 0,
+          recoveryBytes: 500 * bytesPerMiB,
+        ),
+        runtimeIdleGrace: const Duration(seconds: 1),
+        now: () => clock,
+      );
+      await managed.start();
+      addTearDown(managed.close);
+      expect((await managed.ensureRoot(rootB)).added, isTrue);
+
+      pressureLevel = 2;
+      clock = clock.add(const Duration(seconds: 2));
+      expect(await managed.monitorMemoryPressureOnce(), isEmpty);
+      expect(await managed.monitorMemoryPressureOnce(), [rootB]);
+      expect(managed.activeRoots, [rootA]);
+    },
+  );
+
+  test('addRoot operation reports structured admission denial', () async {
+    final rootA = a.resolveSymbolicLinksSync();
+    final rootB = b.resolveSymbolicLinksSync();
+    final managed = AnalyzerDaemon(rootA, maxRoots: 1);
+    await managed.start();
+    addTearDown(managed.close);
+
+    final response = await managed.handle({'op': 'addRoot', 'root': rootB});
+    expect(response['ok'], isFalse);
+    expect(response['code'], 'pool-admission-denied');
+    expect(response['reason'], 'root-limit');
+    expect(response['evicted'], isEmpty);
+    expect(managed.activeRoots, [rootA]);
   });
 
   test('fullCheck with root answers only for that root', () async {

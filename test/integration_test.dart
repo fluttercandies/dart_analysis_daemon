@@ -218,12 +218,16 @@ Future<ProcessResult> _run(
   String command,
   String root, [
   List<String> arguments = const [],
-]) => Process.run(Platform.resolvedExecutable, [
-  'bin/dart_analysis_daemon.dart',
-  command,
-  '--root',
-  root,
-  ...arguments,
-], workingDirectory: Directory.current.path);
+]) => Process.run(
+  Platform.resolvedExecutable,
+  ['bin/dart_analysis_daemon.dart', command, '--root', root, ...arguments],
+  workingDirectory: Directory.current.path,
+  environment: {
+    ...Platform.environment,
+    'DANA_MULTI_ROOT': '0',
+    'DANA_POOL_MAX_ROOTS': '3',
+    'DANA_GLOBAL_BUDGET': '0',
+  },
+);
 
 String _details(ProcessResult result) => '${result.stdout}${result.stderr}';

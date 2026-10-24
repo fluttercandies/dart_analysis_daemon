@@ -9,6 +9,7 @@ class SystemMemorySnapshot {
     required this.availablePhysicalBytes,
     required this.commitLimitBytes,
     required this.availableCommitBytes,
+    this.pressureLevel,
     DateTime? sampledAt,
   }) : sampledAt = sampledAt ?? DateTime.now().toUtc();
 
@@ -16,6 +17,7 @@ class SystemMemorySnapshot {
   final int availablePhysicalBytes;
   final int commitLimitBytes;
   final int availableCommitBytes;
+  final int? pressureLevel;
   final DateTime sampledAt;
 
   bool freshAt(DateTime now) {
@@ -36,6 +38,7 @@ class SystemMemorySnapshot {
     'availablePhysicalMiB': availablePhysicalBytes / bytesPerMiB,
     'commitLimitMiB': commitLimitBytes / bytesPerMiB,
     'availableCommitMiB': availableCommitBytes / bytesPerMiB,
+    if (pressureLevel != null) 'pressureLevel': pressureLevel,
   };
 }
 
@@ -318,8 +321,8 @@ SystemMemorySnapshot? Function()? platformMemorySampler() {
 /// physical memory, except that a kernel memory-pressure level of warn (2) or
 /// worse reports no available commit. "Available" pages alone stay near the
 /// reserve under compression and swap even while the system is thrashing; the
-/// pressure level is the kernel's own verdict on that state. An unknown level
-/// (null) leaves the physical figure unchanged.
+/// multi-root admission policy may explicitly treat warn as advisory, while
+/// the global budget and runtime monitor retain the pressure signal.
 SystemMemorySnapshot macSnapshot({
   required int totalPhysicalBytes,
   required int availablePhysicalBytes,
@@ -332,6 +335,7 @@ SystemMemorySnapshot macSnapshot({
     availablePhysicalBytes: availablePhysicalBytes,
     commitLimitBytes: totalPhysicalBytes,
     availableCommitBytes: underPressure ? 0 : availablePhysicalBytes,
+    pressureLevel: pressureLevel,
     sampledAt: sampledAt,
   );
 }

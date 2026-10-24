@@ -36,7 +36,21 @@ Apple Silicon，24 GB 内存。
 | 资源 | 不用 `dana` | 用 `dana` | 节省 |
 | ---- | ----------- | --------- | ---- |
 | 开着 IDE 时额外占用的内存 | 再起一个 analyzer，约 9 GB | 无（proxy 不到 100 MB） | 约 9 GB |
-| 依次检查 5 个 worktree | 每个约 10 GB，5 个约 50 GB | 合计峰值约 21 GB（池保留 2 个 root） | 约 29 GB（约 60%） |
+
+### 同仓多 worktree 对照（Windows）
+
+内存测试为每个 root 20,003 个文件的轻量合成项目；延迟测试使用真实 Dart SDK
+`pkg/analyzer`，不启用插件，热身后串行请求。
+
+| 测量项 | 基线 | 共享多根池 | 差值 |
+| ------ | ---- | -------- | ---- |
+| 两个合成 worktree 检查后的 analyzer Job 私有提交 | 2,464.2 MiB（两个 worker） | 1,434.9 MiB（一个 worker） | 节省 1,029.3 MiB（41.8%） |
+| 真实 SDK `pkg/analyzer` 热态单文件（p50 / p95，n=45） | 32.328 / 36.045 ms | 32.908 / 36.379 ms | +0.580 / +0.334 ms |
+| 真实 SDK `pkg/analyzer` 热态 40 文件目录（p50 / p95，n=45） | 14.489 / 17.822 ms | 14.637 / 20.000 ms | +0.148 / +2.178 ms |
+
+内存测试使用轻量合成源码，指标是 analyzer Job 私有提交，不是 Dart heap 或工作集，不能
+作为大型 Flutter 项目的节省估算。延迟测试不涵盖冷启动、首次加入 root、插件分析或并发
+请求；内存基线为每个 worktree 各自运行 analyzer，延迟基线为单 root worker。
 
 - 结果与 `dart analyze` 全项目检查一致，包括插件 lint。
 - Dart 3.14 之前，`dart analyze <目录>` 不报插件 lint
@@ -102,7 +116,13 @@ dana stop --root path/to/project
   `.dart_tool`、非 Dart 文件和被 analyzer 排除的文件会跳过。
 - 退出码与 `dart analyze` 一致：有 error 或 warning 时为 `1`，只有 info 或没有诊断时为
   `0`。`--[no-]fatal-warnings`（默认开）和 `--[no-]fatal-infos`（默认关）的含义同
-  `dart analyze`。`64` 表示参数错误，`69` 表示无法建立 session。
+  `dart analyze`。`64` 表示参数错误，`69` 表示无法建立 session。`75` 表示多根池拒绝
+  准入，不会另起 analyzer。`memory-pressure` 可在内存恢复后重试（淘汰后至少间隔 10 秒）。
+  对 macOS 多根池，`warn` 压力级别只作提示，只有 `critical` 才会强制走准入拒绝路径，同时仍检查物理余量；
+  全局单 worker 预算仍把 `warn` 视为提交压力；多根池后台回收忽略 `warn`，只有 `critical`
+  或物理余量不足才会进入多根池压力回收路径。
+  `root-limit` 需释放 root 或调整上限；`memory-sample-unavailable` 需恢复受支持的采样。
+  不要对 `75` 进行无间隔重试。
 - 输出是一个 JSON 对象，包含 `ok`、`source`（`ide-bridge` 或 `daemon-session`）、各级别
   计数，以及按文件归组的 `diagnostics`。
 
@@ -127,17 +147,29 @@ dana stop --root path/to/project
 ## 多个 worktree（多根池）
 
 设置 `DANA_MULTI_ROOT=1` 后，第一个 session 会登记为共享池，之后其他 root 的检查加入
-这个池，不再各自启动 analyzer。
+这个池，不再各自启动 analyzer；只有 Dart runtime 和相关配置兼容时才会加入。
 
 - `--mode full` 只返回请求的那个 root。
-- `DANA_POOL_MAX_ROOTS`（1–64，默认 3）限制同时分析的 root 数。超出时淘汰最久未用的
-  root；池的第一个 root 和本次请求的 root 不会被淘汰。
-- 加入时内存不足也会淘汰（macOS 以内核内存压力等级达到 warn 及以上为准）。每淘汰一个 root，池会最多等 10 秒让它的内存释放，再决定是否继续淘汰。
-- 被淘汰的 root 下次检查时重新加入，需要重新付一次首次分析的耗时。已分析过的文件重查只要
-  几十毫秒；大型 root 刚加入后的第一次检查要几十秒到一分多钟。
-- 池省下的是一个 analyzer 进程和它的启动，不是分析内存。每个 root 仍需要大约一个
-  analyzer 的内存：在 15,000+ 个文件的项目上，一个 root 约 10 GB，两个 root 约 18 GB。
-  内存只在 root 加入时检查，已在池里的 root 内存继续增长不会触发淘汰。
+- `DANA_POOL_MAX_ROOTS`（1–64，默认 3）控制池最多保留的 root 数。达到上限时会淘汰
+  最久未用且可淘汰的 root；池的第一个 root 和本次请求的 root 不会被淘汰。没有可淘汰的
+  root 时会明确拒绝加入，不会另起一个 analyzer。
+- Windows 和 macOS 会在新 root 加入前检查当前可用物理/提交内存；内存不足时按 LRU
+  尝试淘汰一个 LRU root 并立即重新采样，不等待后台分析完成，也不在请求队列中睡眠。
+  后续压力淘汰有 10 秒冷却期，让内存有时间释放。采样不可用或仍无法确认余量时会拒绝加入，
+  CLI 会在 stderr 和 JSON 结果中提示。其他平台当前没有受支持的内存采样器；启用内存策略时，
+  会拒绝加入额外 root。macOS 多根池的 `warn` 单独不会拒绝新 root，也不会回收 root，`critical`
+  或物理余量不足才会处理。这是尽力而为的保护，不是 analyzer 的硬内存上限。
+- 池空闲时每 2 秒采样；连续 2 次低于基础保留值后，可能淘汰一个至少 10 秒未使用的非主
+  root；两次回收至少间隔 10 秒，让系统有时间释放已移除的分析上下文。正在进行的分析不会
+  被强制打断；若压力发生在活跃检查期间，系统仍可能先换页或终止进程。
+- 被淘汰的 root 下次检查时需要重新加入并重新建立分析状态；刚加入后的首次检查通常比热态
+  定向检查慢得多。本文延迟对照只测已热身的单文件/目录请求，不代表首次加入或全项目检查耗时。
+- 池不会把每个 root 的分析上下文合并成一份；它主要省下一份 analyzer 进程、运行时和
+  部分共享缓存，因此总内存可能下降，但每个 root 仍保留自己的分析状态。实际差异取决于
+  项目、插件和分析上下文；具体对照见[实测效果](#实测效果)。
+- 内存监控只能观察系统级可用余量，无法估算每个 root 的安全内存，也无法抢占活跃分析。
+  大型分析仍可能先耗尽内存。调大 `DANA_POOL_MAX_ROOTS` 只会允许池保留更多 root，不会合并
+  分析上下文或形成硬上限。
 
 ## Session 生命周期
 
@@ -207,7 +239,7 @@ if (endpoint != null && endpoint.supports('fullCheck')) {
 | `DANA_SESSION_IDLE_TIMEOUT_SECONDS` | 0（不回收） | session 空闲多少秒后回收 |
 | `DANA_BRIDGE_SETTLE_TIMEOUT_SECONDS` | 180 | bridge full 检查等待晚到插件诊断的上限（1–3600） |
 | `DANA_MULTI_ROOT` | 0 | `1` 开启多根池 |
-| `DANA_POOL_MAX_ROOTS` | 3 | 一个池同时分析的 root 数（1–64） |
+| `DANA_POOL_MAX_ROOTS` | 3 | 多根池严格 root 上限；达到后按 LRU 淘汰或明确拒绝加入（1–64） |
 | `DANA_GLOBAL_BUDGET` | 0 | `1` 开启全局预算 |
 | `DANA_GLOBAL_RESERVE_MIB` | 内存的 15%，1024–4096 | 全局预算和多根池准入时保留的空闲内存 |
 | `DANA_GLOBAL_STARTUP_MIB` / `DANA_GLOBAL_RECOVERY_MIB` | 512 / 256 | 启动或恢复 worker 时额外预留的内存 |

@@ -86,6 +86,7 @@ Future<void> serveSession(
             memorySampler: platformMemorySampler(),
             budgetPolicy: GlobalBudgetPolicy.fromEnvironment(
               Platform.environment,
+              ignoreWarnPressure: true,
             ),
           )
           : AnalyzerDaemon(root));
@@ -162,6 +163,54 @@ Future<void> serveSession(
   Object? closeFailure;
   StackTrace? closeStack;
   Completer<void>? shutdownResponseSent;
+  Timer? memoryMonitor;
+  var memoryMonitorQueued = false;
+
+  Future<void> refreshPoolRegistry() async {
+    final identitySnapshot = poolIdentitySnapshot;
+    if (!registeredAsPool || identitySnapshot == null) return;
+    try {
+      await writePoolRegistry(
+        PoolRegistration(
+          address: InternetAddress.loopbackIPv4.address,
+          port: server.port,
+          token: token,
+          pid: pid,
+          roots: daemon.activeRoots,
+          identity: identitySnapshot,
+        ),
+      );
+    } catch (error) {
+      stderr.writeln('[dana] pool registry refresh failed: $error');
+    }
+  }
+
+  void queueMemoryMonitor() {
+    if (memoryMonitorQueued || shuttingDown) return;
+    memoryMonitorQueued = true;
+    requestQueue = requestQueue
+        .then((_) async {
+          try {
+            if (shuttingDown) return;
+            final evicted = await daemon.monitorMemoryPressureOnce();
+            if (evicted.isNotEmpty) {
+              stderr.writeln(
+                '[dana] reclaimed idle pool roots under memory pressure: '
+                '${evicted.join(', ')}',
+              );
+              await refreshPoolRegistry();
+            }
+          } catch (error) {
+            stderr.writeln('[dana] pool memory monitor failed: $error');
+          } finally {
+            memoryMonitorQueued = false;
+          }
+        })
+        .catchError((Object error) {
+          memoryMonitorQueued = false;
+          stderr.writeln('[dana] pool memory monitor queue failed: $error');
+        });
+  }
 
   void rethrowCloseFailure() {
     if (closeFailure != null) {
@@ -176,6 +225,8 @@ Future<void> serveSession(
       return;
     }
     shuttingDown = true;
+    memoryMonitor?.cancel();
+    memoryMonitor = null;
     idlePolicy.close();
     try {
       await server.close();
@@ -216,6 +267,12 @@ Future<void> serveSession(
       );
     },
   );
+
+  if (registeredAsPool) {
+    memoryMonitor = Timer.periodic(const Duration(seconds: 2), (_) {
+      queueMemoryMonitor();
+    });
+  }
 
   server.listen((socket) {
     if (shuttingDown) {
@@ -275,29 +332,10 @@ Future<void> serveSession(
                           // A pool-owning session republishes its registry when
                           // a peer joins or leaves, so the advertised root set
                           // matches the analyzer's actual roots.
-                          final identitySnapshot = poolIdentitySnapshot;
-                          if (registeredAsPool &&
-                              identitySnapshot != null &&
-                              poolRootsChanged(command, response)) {
-                            try {
-                              await writePoolRegistry(
-                                PoolRegistration(
-                                  address: InternetAddress.loopbackIPv4.address,
-                                  port: server.port,
-                                  token: token,
-                                  pid: pid,
-                                  roots: daemon.activeRoots,
-                                  identity: identitySnapshot,
-                                ),
-                              );
-                            } catch (error) {
-                              // A failed refresh must not fail the client's
-                              // check: the analyzer already applied the root
-                              // change; only the advertised set is stale.
-                              stderr.writeln(
-                                '[dana] pool registry refresh failed: $error',
-                              );
-                            }
+                          if (poolRootsChanged(command, response)) {
+                            // The analyzer already applied the root change;
+                            // a registry write failure must not fail the check.
+                            await refreshPoolRegistry();
                           }
                         }
                       }

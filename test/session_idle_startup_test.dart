@@ -16,6 +16,10 @@ void main() {
     ['--packages=$config', driver, 'client', root],
     workingDirectory: packageRoot,
     environment: {
+      ...Platform.environment,
+      'DANA_MULTI_ROOT': '0',
+      'DANA_POOL_MAX_ROOTS': '3',
+      'DANA_GLOBAL_BUDGET': '0',
       'DANA_SESSION_IDLE_TIMEOUT_SECONDS': timeout,
       'DANA_ANALYSIS_TIMEOUT_SECONDS': '12',
       'DANA_DART_EXECUTABLE': Platform.resolvedExecutable,
@@ -53,6 +57,10 @@ void main() {
           'fixture-token',
         ],
         environment: {
+          ...Platform.environment,
+          'DANA_MULTI_ROOT': '0',
+          'DANA_POOL_MAX_ROOTS': '3',
+          'DANA_GLOBAL_BUDGET': '0',
           'DANA_SESSION_IDLE_TIMEOUT_SECONDS': '0',
           'DANA_TEST_CLOSE_FAILURE': fails ? '1' : '0',
           'DANA_DART_EXECUTABLE': Platform.resolvedExecutable,
@@ -72,7 +80,12 @@ void main() {
               '--root',
               root,
             ],
-            environment: {'DANA_DART_EXECUTABLE': Platform.resolvedExecutable},
+            environment: {
+              ...Platform.environment,
+              'DANA_MULTI_ROOT': '0',
+              'DANA_GLOBAL_BUDGET': '0',
+              'DANA_DART_EXECUTABLE': Platform.resolvedExecutable,
+            },
           );
           expect(result.exitCode, 1);
           expect((jsonDecode('${result.stdout}') as Map)['ok'], false);
@@ -202,7 +215,12 @@ void main() {
           '--files',
           'probe.dart',
         ],
-        environment: {'DANA_SESSION_IDLE_TIMEOUT_SECONDS': 'invalid'},
+        environment: {
+          ...Platform.environment,
+          'DANA_MULTI_ROOT': '0',
+          'DANA_GLOBAL_BUDGET': '0',
+          'DANA_SESSION_IDLE_TIMEOUT_SECONDS': 'invalid',
+        },
       ).timeout(const Duration(seconds: 10));
       expect(result.exitCode, 64, reason: '${result.stderr}');
       expect('${result.stderr}', contains('Session idle timeout'));

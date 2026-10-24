@@ -76,6 +76,6 @@ void main() {
     }
     final version = await run(['--version']);
     expect(version.exitCode, 0);
-    expect('${version.stdout}'.trim(), '0.1.2');
+    expect('${version.stdout}'.trim(), '0.2.0');
   });
 }

@@ -25,20 +25,62 @@ void main() {
     );
   });
 
-  for (final level in [2, 4]) {
-    test('pressure level $level leaves no commit and refuses admission', () {
-      final s = snap(level);
-      expect(s.availablePhysicalBytes, available);
-      expect(s.availableCommitBytes, 0);
-      expect(s.freshAt(now), isTrue);
-      expect(
-        policy.waitingReason(s, starting: true, recovering: false, now: now),
-        'commit-reserve',
-      );
-    });
-  }
+  test('warn pressure remains a commit-pressure signal', () {
+    final s = snap(2);
+    expect(s.availablePhysicalBytes, available);
+    expect(s.availableCommitBytes, 0);
+    expect(
+      policy.waitingReason(s, starting: true, recovering: false, now: now),
+      'commit-reserve',
+    );
+  });
+
+  test('critical pressure leaves no commit and refuses admission', () {
+    final s = snap(4);
+    expect(s.availablePhysicalBytes, available);
+    expect(s.availableCommitBytes, 0);
+    expect(s.freshAt(now), isTrue);
+    expect(
+      policy.waitingReason(s, starting: true, recovering: false, now: now),
+      'commit-reserve',
+    );
+  });
 
   test('an unknown pressure level does not change the physical figure', () {
     expect(snap(null).availableCommitBytes, available);
+  });
+
+  test('multi-root policy ignores warn for admission and reclamation', () {
+    final advisory = GlobalBudgetPolicy(
+      reserveBytes: 4000 * bytesPerMiB,
+      ignoreWarnPressure: true,
+    );
+    expect(
+      advisory.waitingReason(
+        snap(2),
+        starting: true,
+        recovering: false,
+        now: now,
+      ),
+      isNull,
+    );
+    expect(
+      advisory.waitingReason(
+        snap(2),
+        starting: false,
+        recovering: false,
+        now: now,
+      ),
+      isNull,
+    );
+    expect(
+      advisory.waitingReason(
+        snap(4),
+        starting: true,
+        recovering: false,
+        now: now,
+      ),
+      'commit-reserve',
+    );
   });
 }

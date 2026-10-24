@@ -28,15 +28,21 @@ class AnalyzerDaemon {
     this.maxRoots,
     DateTime Function()? now,
     this.evictionSettleLimit = const Duration(seconds: 10),
-    Future<void> Function(Duration)? delay,
+    this.runtimeIdleGrace = const Duration(seconds: 10),
+    bool Function()? analysisInProgress,
   }) : _processStarter = processStarter,
        _ownedProcessStarter = ownedProcessStarter,
        _memorySampler = memorySampler,
        _budgetPolicy = budgetPolicy,
-       _now = now ?? (() => DateTime.now().toUtc()),
-       _delay = delay ?? Future<void>.delayed {
+       _analysisInProgressOverride = analysisInProgress,
+       _now = now ?? (() => DateTime.now().toUtc()) {
     if (processStarter != null && ownedProcessStarter != null) {
       throw ArgumentError('Choose one process starter');
+    }
+    if ((maxRoots != null && maxRoots! < 1) ||
+        evictionSettleLimit.isNegative ||
+        runtimeIdleGrace.isNegative) {
+      throw ArgumentError('Invalid multi-root memory policy');
     }
   }
 
@@ -51,23 +57,24 @@ class AnalyzerDaemon {
   // Per-root last-use time (canonical path -> timestamp) for LRU eviction.
   final _rootLastUsed = <String, DateTime>{};
 
-  /// Upper bound on concurrently analyzed roots; null means unbounded.
-  /// Enforced by [ensureRoot] (and so by pool joins) through LRU eviction,
-  /// independently of memory sampling: each large root costs gigabytes, and
-  /// a sampler can read "enough" right up until the system swaps.
+  /// Strict upper bound on concurrently analyzed roots; null means unbounded.
   final int? maxRoots;
   final SystemMemorySnapshot? Function()? _memorySampler;
   final GlobalBudgetPolicy? _budgetPolicy;
+  final bool Function()? _analysisInProgressOverride;
   final DateTime Function() _now;
 
-  /// How long a memory-driven eviction waits for memory to come back before
+  /// How long a memory-driven eviction allows memory to come back before
   /// deciding whether another root must go. Releasing a large root takes
   /// seconds (measured ~5 s for ~7 GiB on macOS), and the kernel pressure level
   /// lags further; resampling immediately reads the pre-eviction state and
   /// evicts every idle root.
   final Duration evictionSettleLimit;
-  final Future<void> Function(Duration) _delay;
-  static const _evictionSettlePoll = Duration(milliseconds: 500);
+
+  /// A root must have been unused for this long before runtime reclamation.
+  final Duration runtimeIdleGrace;
+  DateTime? _lastEvictionAt;
+  static const _runtimeMonitorCooldown = Duration(seconds: 10);
   final Future<Process> Function()? _processStarter;
   final Future<AnalyzerProcess> Function()? _ownedProcessStarter;
   late final AnalyzerProcess _process;
@@ -77,6 +84,10 @@ class AnalyzerDaemon {
       StreamController.broadcast();
   Future<void> _writeQueue = Future<void>.value();
   bool _isAnalyzing = false;
+  bool get _analysisInProgress =>
+      _isAnalyzing || (_analysisInProgressOverride?.call() ?? false);
+  int _lowMemorySamples = 0;
+  bool _runtimeRecoveryPending = false;
   int _nextId = 0;
   bool _started = false;
   bool _closed = false;
@@ -104,18 +115,33 @@ class AnalyzerDaemon {
         : null;
   }
 
+  SystemMemorySnapshot? _sampleMemory() {
+    try {
+      return _memorySampler?.call();
+    } on Object {
+      return null;
+    }
+  }
+
   Future<void> start() => _startFuture ??= _start();
 
   /// Roots this server is currently analyzing, in insertion order.
   List<String> get activeRoots => List.unmodifiable(_activeRoots);
 
   /// Adds [newRoot] to the analyzed set, so this one server also analyzes that
-  /// worktree. No-op if already present. Returns true if the set changed.
+  /// worktree, subject to configured admission policy. Returns true only when
+  /// the root was newly admitted.
   Future<bool> addRoot(String newRoot) async {
+    final result = await ensureRoot(newRoot);
+    return result.added;
+  }
+
+  Future<bool> _applyAddRoot(String newRoot) async {
     _throwIfFailed();
     final canonical = File(newRoot).absolute.path;
     if (_activeRoots.contains(canonical)) return false;
     _activeRoots.add(canonical);
+    _rootLastUsed[canonical] = _now();
     await _applyRoots();
     return true;
   }
@@ -130,6 +156,7 @@ class AnalyzerDaemon {
       return false;
     }
     _activeRoots.remove(canonical);
+    _rootLastUsed.remove(canonical);
     // Drop cached diagnostics that belonged to the removed root so they can
     // never leak into a later full/directory result.
     _errors.removeWhere((path, _) => _isUnderRoot(path, canonical));
@@ -148,23 +175,19 @@ class AnalyzerDaemon {
   /// Ensures [requestedRoot] is active, evicting least-recently-used idle roots
   /// first when memory is tight. This is the IDE-style behaviour: keep several
   /// worktrees warm for instant re-review, but drop the stalest one under
-  /// pressure rather than OOM. Marks the root as just-used. Requires a memory
-  /// sampler and budget policy; without them it simply adds the root.
-  ///
-  /// [pinned] roots are never evicted (e.g. the root with an in-flight check).
-  /// Admits [requestedRoot], first evicting least-recently-used roots while
-  /// memory is short (only when a sampler and policy were supplied). Returns
-  /// whether the root set gained [requestedRoot] and which roots were evicted.
-  Future<({bool added, List<String> evicted})> ensureRoot(
+  /// pressure rather than OOM. Configured root and memory limits fail closed:
+  /// the result reports a denial rather than exceeding a limit. [pinned] roots
+  /// and the primary root are never evicted automatically.
+  Future<({bool added, List<String> evicted, String? deniedReason})> ensureRoot(
     String requestedRoot, {
     Set<String> pinned = const {},
   }) async {
     _throwIfFailed();
     final canonical = File(requestedRoot).absolute.path;
-    _rootLastUsed[canonical] = _now();
     final evicted = <String>[];
     if (_activeRoots.contains(canonical)) {
-      return (added: false, evicted: evicted);
+      _rootLastUsed[canonical] = _now();
+      return (added: false, evicted: evicted, deniedReason: null);
     }
 
     // Never evict the primary root, the requested root, pinned roots, or the
@@ -174,49 +197,93 @@ class AnalyzerDaemon {
       File(root).absolute.path,
       canonical,
     };
-    final cap = maxRoots;
-    if (cap != null) {
-      // Make room so that admitting the requested root stays within the cap.
-      while (_activeRoots.length >= cap) {
-        final victim = _lruEvictable(pinnedCanonical);
-        if (victim == null) break;
-        if (await removeRoot(victim)) evicted.add(victim);
-      }
-    }
     final sampler = _memorySampler;
     final policy = _budgetPolicy;
-    if (sampler != null && policy != null) {
+    if (policy == null) {
+      while (maxRoots != null && _activeRoots.length >= maxRoots!) {
+        final victim = _lruEvictable(pinnedCanonical);
+        if (victim == null || !await removeRoot(victim)) {
+          return (added: false, evicted: evicted, deniedReason: 'root-limit');
+        }
+        evicted.add(victim);
+      }
+    }
+    if (policy != null && sampler == null) {
+      return (
+        added: false,
+        evicted: evicted,
+        deniedReason: 'memory-sample-unavailable',
+      );
+    }
+    if (policy != null) {
       // Evict LRU idle roots while admitting a new one would be refused for
       // memory.
-      String? tight() => policy.waitingReason(
-        sampler(),
+      final activePolicy = policy;
+      String? tight() => activePolicy.waitingReason(
+        _sampleMemory(),
         starting: true,
         recovering: false,
         now: _now(),
       );
-      while (_activeRoots.length > 1) {
-        if (tight() == null) break; // Enough memory to add another root.
-        final victim = _lruEvictable(pinnedCanonical);
-        if (victim == null) break; // Nothing left to evict; admit anyway.
-        if (!await removeRoot(victim)) break;
-        evicted.add(victim);
-        // Let the released context actually leave memory before judging again.
-        var waited = Duration.zero;
-        while (waited < evictionSettleLimit && tight() != null) {
-          await _delay(_evictionSettlePoll);
-          waited += _evictionSettlePoll;
+      while (true) {
+        final pressure = tight();
+        if (pressure == 'memory-sample-unavailable') {
+          return (added: false, evicted: evicted, deniedReason: pressure);
         }
+        final atRootLimit =
+            maxRoots != null && _activeRoots.length >= maxRoots!;
+        if (!atRootLimit && pressure == null) break;
+        // Do not evict every context on a stale post-eviction sample. Return
+        // promptly so the session queue can serve other roots during recovery.
+        if (pressure != null &&
+            (evicted.isNotEmpty ||
+                (_lastEvictionAt != null &&
+                    _now().difference(_lastEvictionAt!) <
+                        evictionSettleLimit))) {
+          return (
+            added: false,
+            evicted: evicted,
+            deniedReason: 'memory-pressure',
+          );
+        }
+        final victim = _lruEvictable(pinnedCanonical);
+        if (victim == null && atRootLimit) {
+          return (added: false, evicted: evicted, deniedReason: 'root-limit');
+        }
+        if (victim == null) {
+          return (
+            added: false,
+            evicted: evicted,
+            deniedReason: 'memory-pressure',
+          );
+        }
+        if (!await removeRoot(victim)) {
+          return (
+            added: false,
+            evicted: evicted,
+            deniedReason: pressure != null ? 'memory-pressure' : 'root-limit',
+          );
+        }
+        evicted.add(victim);
+        _lastEvictionAt = _now();
       }
     }
-    return (added: await addRoot(canonical), evicted: evicted);
+    final added = await _applyAddRoot(canonical);
+    if (added) _rootLastUsed[canonical] = _now();
+    return (added: added, evicted: evicted, deniedReason: null);
   }
 
-  String? _lruEvictable(Set<String> pinned) {
+  String? _lruEvictable(Set<String> pinned, {bool requireRuntimeIdle = false}) {
     String? oldest;
     DateTime? oldestAt;
     for (final r in _activeRoots) {
       if (pinned.contains(r)) continue;
       final at = _rootLastUsed[r] ?? DateTime.fromMillisecondsSinceEpoch(0);
+      final unusedFor = _now().difference(at);
+      if (requireRuntimeIdle &&
+          (unusedFor.isNegative || unusedFor < runtimeIdleGrace)) {
+        continue;
+      }
       if (oldestAt == null || at.isBefore(oldestAt)) {
         oldest = r;
         oldestAt = at;
@@ -225,8 +292,81 @@ class AnalyzerDaemon {
     return oldest;
   }
 
+  /// Samples memory and reclaims one sufficiently idle non-primary root.
+  /// The caller must serialize this with client requests and publish registry
+  /// changes when a root is removed.
+  Future<List<String>> monitorMemoryPressureOnce() async {
+    final sampler = _memorySampler;
+    final policy = _budgetPolicy;
+    if (!_started ||
+        _closed ||
+        _analysisInProgress ||
+        sampler == null ||
+        policy == null) {
+      return const [];
+    }
+    final SystemMemorySnapshot? sample;
+    try {
+      sample = sampler();
+    } on Object {
+      _lowMemorySamples = 0;
+      _runtimeRecoveryPending = false;
+      return const [];
+    }
+    if (sample == null || !sample.freshAt(_now())) {
+      _lowMemorySamples = 0;
+      _runtimeRecoveryPending = false;
+      return const [];
+    }
+
+    final recoveryReason = policy.waitingReason(
+      sample,
+      starting: false,
+      recovering: true,
+      now: _now(),
+    );
+    if (_runtimeRecoveryPending) {
+      if (recoveryReason == null) {
+        _runtimeRecoveryPending = false;
+        _lowMemorySamples = 0;
+        return const [];
+      }
+    } else {
+      final pressureReason = policy.waitingReason(
+        sample,
+        starting: false,
+        recovering: false,
+        now: _now(),
+      );
+      if (pressureReason == null) {
+        _lowMemorySamples = 0;
+        return const [];
+      }
+      _lowMemorySamples++;
+      if (_lowMemorySamples < 2) return const [];
+      _runtimeRecoveryPending = true;
+    }
+
+    final lastEviction = _lastEvictionAt;
+    if (lastEviction != null &&
+        _now().difference(lastEviction) < _runtimeMonitorCooldown) {
+      return const [];
+    }
+    final pinned = {File(root).absolute.path};
+    final victim = _lruEvictable(pinned, requireRuntimeIdle: true);
+    if (victim == null || _analysisInProgress) return const [];
+    if (await removeRoot(victim)) {
+      _lastEvictionAt = _now();
+      _lowMemorySamples = 0;
+      return [victim];
+    }
+    return const [];
+  }
+
   Future<void> _start() async {
-    _activeRoots.add(File(root).absolute.path);
+    final primaryRoot = File(root).absolute.path;
+    _activeRoots.add(primaryRoot);
+    _rootLastUsed[primaryRoot] = _now();
     try {
       final dartExecutable = await resolveDartExecutable();
       if (_ownedProcessStarter != null) {
@@ -316,6 +456,30 @@ class AnalyzerDaemon {
         // Pool joins go through ensureRoot so a memory-short pool evicts its
         // least-recently-used idle roots instead of growing without bound.
         final admitted = await ensureRoot(target);
+        if (admitted.deniedReason != null) {
+          final reason = admitted.deniedReason!;
+          final message = switch (reason) {
+            'root-limit' =>
+              'The shared analyzer pool is at its root limit and has no '
+                  'eligible root to evict.',
+            'memory-pressure' =>
+              'The shared analyzer pool cannot confirm enough memory. '
+                  'Retry after memory recovery.',
+            'memory-sample-unavailable' =>
+              'System memory could not be sampled; the pool refused to add '
+                  'another root.',
+            _ => 'The shared analyzer pool refused the root.',
+          };
+          return {
+            'ok': false,
+            'code': 'pool-admission-denied',
+            'reason': reason,
+            'error': message,
+            'fallbackStarted': false,
+            'changed': false,
+            'evicted': admitted.evicted,
+          };
+        }
         return {
           'ok': true,
           'changed': admitted.added,
@@ -548,6 +712,14 @@ class AnalyzerDaemon {
       };
     }
     final files = value.cast<String>();
+    for (final path in files) {
+      for (final r in _activeRoots) {
+        if (_isUnderRoot(path, r)) {
+          _rootLastUsed[r] = _now();
+          break;
+        }
+      }
+    }
     await _request('analysis.updateContent', {
       'files': {
         for (final path in files) path: {'type': 'remove'},
@@ -563,6 +735,11 @@ class AnalyzerDaemon {
     final scope = root == null ? null : File(root).absolute.path;
     if (scope != null && !_activeRoots.any((r) => _isUnderRoot(scope, r))) {
       return {'ok': false, 'error': 'fullCheck.root is not analyzed: $root'};
+    }
+    for (final r in _activeRoots) {
+      if (scope == null || _isUnderRoot(scope, r) || _isUnderRoot(r, scope)) {
+        _rootLastUsed[r] = _now();
+      }
     }
     final stopwatch = Stopwatch()..start();
     // The shared session's analysis server already watches the file system and

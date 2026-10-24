@@ -1,3 +1,29 @@
+## 0.2.0
+
+- Make multi-root admission non-blocking: do not wait for an active analysis
+  or a memory timeout before deciding whether a root can be evicted.
+- Reject immediately when the pool has no eligible root, and add a short
+  post-eviction cooldown so stale memory samples cannot evict several roots in
+  one request sequence.
+- Treat macOS `warn` pressure as advisory for shared-pool new-root admission;
+  reserve that admission rejection for `critical` pressure or insufficient
+  physical headroom, and share one cooldown between admission and background
+  eviction.
+- Keep macOS `warn` as a pressure signal for the global single-worker budget,
+  while shared-pool admission and background reclamation use the same advisory
+  warn rule and wait for `critical` or insufficient physical headroom.
+- Isolate integration and idle-session tests from caller-provided multi-root
+  environment variables.
+
+- Protect the opt-in multi-root pool with bounded root admission and system
+  memory checks. When the pool cannot safely admit a root, `dana` reports the
+  reason and does not silently start a separate analyzer.
+- Reclaim eligible idle non-primary roots under sustained memory pressure;
+  active analysis is not interrupted, and this best-effort policy is not a
+  hard memory limit.
+- Keep the shared-pool registry synchronized after runtime eviction and report
+  measured Windows worktree memory and latency comparisons in the README.
+
 ## 0.1.2
 
 - Require `pubspec.yaml` within the workspace for IDE bridge reuse;

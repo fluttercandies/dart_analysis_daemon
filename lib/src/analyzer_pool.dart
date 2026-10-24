@@ -142,8 +142,7 @@ bool poolRootsChanged(
   Map<String, Object?> response,
 ) =>
     (command['op'] == 'addRoot' || command['op'] == 'removeRoot') &&
-    response['ok'] == true &&
-    (response['changed'] == true ||
+    ((response['ok'] == true && response['changed'] == true) ||
         (response['evicted'] is List &&
             (response['evicted'] as List).isNotEmpty));
 

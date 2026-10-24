@@ -145,6 +145,20 @@ Future<void> main(List<String> args) async {
         isTrue,
       );
     });
+    test('eviction is republished even when the requested root is denied', () {
+      expect(
+        poolRootsChanged(
+          {'op': 'addRoot'},
+          {
+            'ok': false,
+            'code': 'pool-admission-denied',
+            'changed': false,
+            'evicted': ['/b'],
+          },
+        ),
+        isTrue,
+      );
+    });
     test('no-op, failed or unrelated commands do not', () {
       expect(
         poolRootsChanged(

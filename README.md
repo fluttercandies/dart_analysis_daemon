@@ -40,7 +40,24 @@ and two analyzer plugins; Apple Silicon, 24 GB RAM.
 | Resource | Without `dana` | With `dana` | Saved |
 | -------- | -------------- | ----------- | ----- |
 | Extra memory while the IDE is open | another analyzer, ~9 GB | none (proxy < 100 MB) | ~9 GB |
-| Five worktrees checked one after another | ~10 GB each, ~50 GB for five | ~21 GB peak in total (pool keeps 2 roots) | ~29 GB (~60%) |
+
+### Same-repository worktree comparison (Windows)
+
+The memory test used lightweight synthetic projects with 20,003 files per
+root. The latency test used the real Dart SDK `pkg/analyzer`, without plugins,
+after warm-up and with serial requests.
+
+| Measurement | Baseline | Shared multi-root | Difference |
+| ----------- | -------- | ----------------- | ---------- |
+| Analyzer Job private commit after checking two synthetic worktrees | 2,464.2 MiB (two workers) | 1,434.9 MiB (one worker) | 1,029.3 MiB saved (41.8%) |
+| Hot single-file check, real SDK `pkg/analyzer` (p50 / p95, n=45) | 32.328 / 36.045 ms | 32.908 / 36.379 ms | +0.580 / +0.334 ms |
+| Hot 40-file directory check, real SDK `pkg/analyzer` (p50 / p95, n=45) | 14.489 / 17.822 ms | 14.637 / 20.000 ms | +0.148 / +2.178 ms |
+
+The memory test used lightweight synthetic source and measures analyzer Job
+private commit, not Dart heap or working set; it is not an estimate for a large
+Flutter project. The latency test does not cover cold starts, first-time root
+joins, plugin analysis, or concurrent requests. The memory baseline uses one
+independent analyzer per worktree; the latency baseline is a single-root worker.
 
 - Results match `dart analyze` on the whole project, plugin lints included.
 - `dart analyze <folder>` reports no plugin lints before Dart 3.14
@@ -121,7 +138,15 @@ newline-delimited JSON commands from stdin to an existing session;
 - Exit codes follow `dart analyze`: `1` when an error or warning is reported,
   `0` for infos only or no diagnostics. `--[no-]fatal-warnings` (default on)
   and `--[no-]fatal-infos` (default off) behave as in `dart analyze`. `64` is a
-  usage error, `69` means no session could be established.
+  usage error, `69` means no session could be established. `75` means the shared
+  pool refused admission; no separate analyzer was started. Retry memory-pressure
+  denials after memory recovers (allow at least 10 s after an eviction). On
+  For the shared multi-root pool on macOS, `warn` pressure is advisory; only
+  `critical` pressure forces the pressure-denial path, subject to the
+  physical-memory reserve. The global single-worker budget retains `warn` as a
+  commit-pressure signal. For
+  `root-limit`, free a root or adjust the limit; for `memory-sample-unavailable`,
+  restore supported sampling before retrying. Do not busy-loop on `75`.
 - Output is one JSON object with `ok`, `source` (`ide-bridge` or
   `daemon-session`), counts and `diagnostics` keyed by file.
 
@@ -150,23 +175,47 @@ Things to know:
 ## Several worktrees (multi-root pool)
 
 With `DANA_MULTI_ROOT=1`, the first session registers as a shared pool and
-checks for other roots join it instead of starting another analyzer.
+checks for other compatible roots join it instead of starting another analyzer.
 
 - `--mode full` reports only the requested root.
-- `DANA_POOL_MAX_ROOTS` (1–64, default 3) caps the roots analyzed at once.
-  Beyond it the least recently used root is evicted; the first root of the
-  pool and the requested root are never evicted.
-- Joining also evicts under memory pressure (on macOS: a kernel
-  memory-pressure level of warn or worse). After each eviction the pool
-  waits up to 10 s for that memory to be released before deciding on another.
+- `DANA_POOL_MAX_ROOTS` (1–64, default 3) controls how many roots the pool
+  may retain. At the limit it evicts the least recently used eligible root;
+  the pool's first root and the requested root are protected. If no root can
+  be evicted, the join is rejected with a visible error instead of starting a
+  second analyzer.
+- On Windows and macOS, available physical/commit memory is checked before a
+  new root joins. Admission does not wait for background analysis to finish.
+  Under pressure the pool tries one LRU eviction, then resamples without
+  sleeping in the request queue. Further pressure-driven eviction has a 10 s
+  cooldown to allow memory release. If sampling is unavailable or pressure remains,
+  the join is rejected. Other platforms currently lack a supported memory
+  sampler, so additional roots are rejected while memory policy is enabled.
+  On macOS, a kernel `warn` level alone does not reject a new shared-pool root;
+  `critical` does. Background reclamation also ignores `warn` when deciding
+  whether to reclaim an idle root; the global single-worker budget retains its
+  `warn` pressure behavior. Only `critical` or insufficient physical headroom
+  causes the multi-root pressure path.
+  This is a best-effort admission guard, not a hard analyzer memory limit.
+- While the pool is idle, it samples memory every 2 s. After two consecutive
+  low-memory samples it may evict one non-primary root that has been unused
+  for at least 10 s; subsequent evictions are at least 10 s apart to let the
+  analyzer release the removed context.
+  Active analysis is not interrupted; if memory pressure occurs during an
+  active check, the OS can still begin paging or terminate a process first.
 - An evicted root rejoins on its next check and pays its first analysis again.
-  Re-checking an analyzed file takes tens of milliseconds; the first check of a
-  freshly joined large root takes from tens of seconds to over a minute.
-- The pool saves one analyzer process and its startup, not analysis memory.
-  Each root still needs about the memory of its own analyzer: on a 15,000+
-  file project one root takes about 10 GB and two roots about 18 GB. Memory
-  is checked when a root joins, so growth of roots already in the pool does
-  not trigger eviction.
+  Re-checking a warmed file can be fast, but a newly joined root must rebuild
+  analysis state and its first check can be much slower. The latency comparison
+  here measures warmed targeted requests, not first joins or full-project checks.
+- The pool shares the analyzer process and some global caches, but every root
+  retains its own analysis context. Sharing can reduce total memory by avoiding
+  a worker/runtime and some duplicate caches; the actual difference depends on
+  the project, plugins, and analysis state. See [Measured results](#measured-results)
+  for controlled comparisons.
+- Memory monitoring is best-effort and observes system-wide headroom rather
+  than a per-root allocation. A large active analysis can still exhaust memory
+  before idle roots are safe to reclaim. Increasing `DANA_POOL_MAX_ROOTS` only
+  allows more roots to remain resident; it does not merge analysis contexts
+  or create a hard memory cap.
 
 ## Session lifecycle
 
@@ -245,7 +294,7 @@ if (endpoint != null && endpoint.supports('fullCheck')) {
 | `DANA_SESSION_IDLE_TIMEOUT_SECONDS` | 0 (never) | reclaim a session idle for this many seconds |
 | `DANA_BRIDGE_SETTLE_TIMEOUT_SECONDS` | 180 | wait for late plugin diagnostics in a bridge full check (1–3600) |
 | `DANA_MULTI_ROOT` | 0 | `1` enables the multi-root pool |
-| `DANA_POOL_MAX_ROOTS` | 3 | roots one pool analyzes at once (1–64) |
+| `DANA_POOL_MAX_ROOTS` | 3 | strict root limit for the multi-root pool; LRU eviction or explicit admission rejection at the limit (1–64) |
 | `DANA_GLOBAL_BUDGET` | 0 | `1` enables the global budget |
 | `DANA_GLOBAL_RESERVE_MIB` | 15% of RAM, 1024–4096 | memory kept free for the budget and pool admission |
 | `DANA_GLOBAL_STARTUP_MIB` / `DANA_GLOBAL_RECOVERY_MIB` | 512 / 256 | extra headroom to start or recover a worker |

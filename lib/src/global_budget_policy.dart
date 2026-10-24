@@ -9,6 +9,7 @@ class GlobalBudgetPolicy {
     this.queueTimeout = const Duration(seconds: 120),
     this.idleTimeout = const Duration(minutes: 5),
     this.cooldown = const Duration(seconds: 2),
+    this.ignoreWarnPressure = false,
   }) {
     if ((reserveBytes != null && reserveBytes! <= 0) ||
         startupBytes < 0 ||
@@ -26,7 +27,14 @@ class GlobalBudgetPolicy {
   final Duration idleTimeout;
   final Duration cooldown;
 
-  factory GlobalBudgetPolicy.fromEnvironment(Map<String, String> env) {
+  /// The multi-root pool may ignore macOS warn pressure when physical
+  /// headroom is still sufficient. Global single-worker budget keeps this off.
+  final bool ignoreWarnPressure;
+
+  factory GlobalBudgetPolicy.fromEnvironment(
+    Map<String, String> env, {
+    bool ignoreWarnPressure = false,
+  }) {
     int value(String name, int fallback, {bool positive = false}) {
       final text = env[name];
       if (text == null) return fallback;
@@ -54,6 +62,7 @@ class GlobalBudgetPolicy {
       ),
       idleTimeout: Duration(seconds: value('DANA_GLOBAL_IDLE_SECONDS', 300)),
       cooldown: Duration(milliseconds: value('DANA_GLOBAL_COOLDOWN_MS', 2000)),
+      ignoreWarnPressure: ignoreWarnPressure,
     );
   }
 
@@ -80,7 +89,13 @@ class GlobalBudgetPolicy {
     if (sample.availablePhysicalBytes < requiredBytes) {
       return 'physical-reserve';
     }
-    if (sample.availableCommitBytes < requiredBytes) return 'commit-reserve';
+    if (sample.availableCommitBytes < requiredBytes &&
+        !(ignoreWarnPressure &&
+            sample.pressureLevel != null &&
+            sample.pressureLevel! >= 2 &&
+            sample.pressureLevel! < 4)) {
+      return 'commit-reserve';
+    }
     return null;
   }
 
@@ -97,6 +112,7 @@ class GlobalBudgetPolicy {
     'queueTimeoutSeconds': queueTimeout.inSeconds,
     'idleTimeoutSeconds': idleTimeout.inSeconds,
     'cooldownMs': cooldown.inMilliseconds,
+    'ignoreWarnPressure': ignoreWarnPressure,
     'hardMemoryCap': false,
   };
 }
